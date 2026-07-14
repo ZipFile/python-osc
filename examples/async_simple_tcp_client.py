@@ -7,8 +7,8 @@ waiting for 1 seconds between each value in a second task.
 
 import argparse
 import asyncio
+import logging
 import random
-import sys
 
 from pythonosc import tcp_client
 
@@ -47,10 +47,6 @@ async def init_main():
             tg.create_task(send_messages(client))
 
 
-if sys.version_info >= (3, 7):
-    asyncio.run(init_main())
-else:
-    # TODO(python-upgrade): drop this once 3.6 is no longer supported
-    event_loop = asyncio.get_event_loop()
-    event_loop.run_until_complete(init_main())
-    event_loop.close()
+if __name__ == "__main__":
+    logging.basicConfig(level=logging.DEBUG)
+    asyncio.run(init_main(), debug=True)
