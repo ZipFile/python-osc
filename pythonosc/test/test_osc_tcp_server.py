@@ -2,8 +2,11 @@ import struct
 import unittest
 import unittest.mock as mock
 
+from pytest import mark, raises
+
 from pythonosc import dispatcher, osc_tcp_server
-from pythonosc.slip import END
+from pythonosc.parsing.framing import BINARY_LENGTH_FRAMING, SLIP_FRAMING, Framing
+from pythonosc.parsing.slip import END
 
 _SIMPLE_PARAM_INT_MSG = b"/SYNC\x00\x00\x00,i\x00\x00\x00\x00\x00\x04"
 
@@ -21,15 +24,31 @@ LEN_SIMPLE_MSG_NO_PARAMS = struct.pack("!I", len(_SIMPLE_MSG_NO_PARAMS))
 _SIMPLE_MSG_NO_PARAMS_1_1 = END + _SIMPLE_MSG_NO_PARAMS + END
 
 
+class TestGetFraming:
+    @mark.parametrize(
+        ["mode", "framing"],
+        [
+            (osc_tcp_server.MODE_1_0, BINARY_LENGTH_FRAMING),
+            (osc_tcp_server.MODE_1_1, SLIP_FRAMING),
+        ],
+    )
+    def test_ok(self, mode: str, framing: Framing) -> None:
+        assert osc_tcp_server.get_framing(mode) is framing
+
+    def test_unknown(self) -> None:
+        with raises(ValueError, match=r"Unsupported OSC mode: test"):
+            osc_tcp_server.get_framing("test")
+
+
 class TestTCP_1_1_Handler(unittest.TestCase):
     def setUp(self):
         super().setUp()
         self.dispatcher = dispatcher.Dispatcher()
         # We do not want to create real UDP connections during unit tests.
-        self.server = unittest.mock.Mock(spec=osc_tcp_server.BlockingOSCTCPServer)
-        # Need to attach property mocks to types, not objects... weird.
-        type(self.server).dispatcher = unittest.mock.PropertyMock(
-            return_value=self.dispatcher
+        self.server = unittest.mock.Mock(
+            spec=osc_tcp_server.BlockingOSCTCPServer,
+            dispatcher=self.dispatcher,
+            framing=SLIP_FRAMING,
         )
         self.client_address = ("127.0.0.1", 8080)
         self.mock_meth = unittest.mock.MagicMock()
@@ -44,7 +63,7 @@ class TestTCP_1_1_Handler(unittest.TestCase):
             _SIMPLE_PARAM_INT_MSG_1_1,
             b"",
         ]
-        osc_tcp_server._TCPHandler1_1(mock_sock, self.client_address, self.server)
+        osc_tcp_server.TCPHandler(mock_sock, self.client_address, self.server)
         self.assertFalse(self.mock_meth.called)
 
     def test_match_with_args(self):
@@ -52,7 +71,7 @@ class TestTCP_1_1_Handler(unittest.TestCase):
         mock_sock = mock.Mock()
         mock_sock.recv = mock.Mock()
         mock_sock.recv.side_effect = [_SIMPLE_PARAM_INT_MSG_1_1, b""]
-        osc_tcp_server._TCPHandler1_1(mock_sock, self.client_address, self.server)
+        osc_tcp_server.TCPHandler(mock_sock, self.client_address, self.server)
         self.mock_meth.assert_called_with("/SYNC", [1, 2, 3], 4)
 
     def test_match_int9(self):
@@ -60,7 +79,7 @@ class TestTCP_1_1_Handler(unittest.TestCase):
         mock_sock = mock.Mock()
         mock_sock.recv = mock.Mock()
         mock_sock.recv.side_effect = [_SIMPLE_PARAM_INT_9_1_1, b""]
-        osc_tcp_server._TCPHandler1_1(mock_sock, self.client_address, self.server)
+        osc_tcp_server.TCPHandler(mock_sock, self.client_address, self.server)
         self.assertTrue(self.mock_meth.called)
         self.mock_meth.assert_called_with("/debug", 9)
 
@@ -69,7 +88,7 @@ class TestTCP_1_1_Handler(unittest.TestCase):
         mock_sock = mock.Mock()
         mock_sock.recv = mock.Mock()
         mock_sock.recv.side_effect = [_SIMPLE_MSG_NO_PARAMS_1_1, b""]
-        osc_tcp_server._TCPHandler1_1(mock_sock, self.client_address, self.server)
+        osc_tcp_server.TCPHandler(mock_sock, self.client_address, self.server)
         self.mock_meth.assert_called_with("/SYNC")
 
     def test_match_default_handler(self):
@@ -77,7 +96,7 @@ class TestTCP_1_1_Handler(unittest.TestCase):
         mock_sock = mock.Mock()
         mock_sock.recv = mock.Mock()
         mock_sock.recv.side_effect = [_SIMPLE_MSG_NO_PARAMS_1_1, b""]
-        osc_tcp_server._TCPHandler1_1(mock_sock, self.client_address, self.server)
+        osc_tcp_server.TCPHandler(mock_sock, self.client_address, self.server)
         self.mock_meth.assert_called_with("/SYNC")
 
     def test_response_no_args(self):
@@ -90,7 +109,7 @@ class TestTCP_1_1_Handler(unittest.TestCase):
         mock_sock.recv.side_effect = [_SIMPLE_MSG_NO_PARAMS_1_1, b""]
         mock_sock.sendall = mock.Mock()
         mock_sock.sendall.return_value = None
-        osc_tcp_server._TCPHandler1_1(mock_sock, self.client_address, self.server)
+        osc_tcp_server.TCPHandler(mock_sock, self.client_address, self.server)
         mock_sock.sendall.assert_called_with(b"\xc0/SYNC\00\00\00,\00\00\00\xc0")
 
     def test_response_with_args(self):
@@ -108,7 +127,7 @@ class TestTCP_1_1_Handler(unittest.TestCase):
         mock_sock.recv.side_effect = [_SIMPLE_MSG_NO_PARAMS_1_1, b""]
         mock_sock.sendall = mock.Mock()
         mock_sock.sendall.return_value = None
-        osc_tcp_server._TCPHandler1_1(mock_sock, self.client_address, self.server)
+        osc_tcp_server.TCPHandler(mock_sock, self.client_address, self.server)
         mock_sock.sendall.assert_called_with(
             b"\xc0/SYNC\00\00\00,isf\x00\x00\x00\x00\x00\x00\x00\x012\x00\x00\x00@@\x00\x00\xc0"
         )
@@ -119,10 +138,10 @@ class TestTCP_1_0_Handler(unittest.TestCase):
         super().setUp()
         self.dispatcher = dispatcher.Dispatcher()
         # We do not want to create real UDP connections during unit tests.
-        self.server = unittest.mock.Mock(spec=osc_tcp_server.BlockingOSCTCPServer)
-        # Need to attach property mocks to types, not objects... weird.
-        type(self.server).dispatcher = unittest.mock.PropertyMock(
-            return_value=self.dispatcher
+        self.server = unittest.mock.Mock(
+            spec=osc_tcp_server.BlockingOSCTCPServer,
+            dispatcher=self.dispatcher,
+            framing=BINARY_LENGTH_FRAMING,
         )
         self.client_address = ("127.0.0.1", 8080)
         self.mock_meth = unittest.mock.MagicMock()
@@ -139,7 +158,7 @@ class TestTCP_1_0_Handler(unittest.TestCase):
             _SIMPLE_PARAM_INT_MSG,
             b"",
         ]
-        osc_tcp_server._TCPHandler1_0(mock_sock, self.client_address, self.server)
+        osc_tcp_server.TCPHandler(mock_sock, self.client_address, self.server)
         self.assertFalse(self.mock_meth.called)
 
     def test_match_with_args(self):
@@ -151,7 +170,7 @@ class TestTCP_1_0_Handler(unittest.TestCase):
             _SIMPLE_PARAM_INT_MSG,
             b"",
         ]
-        osc_tcp_server._TCPHandler1_0(mock_sock, self.client_address, self.server)
+        osc_tcp_server.TCPHandler(mock_sock, self.client_address, self.server)
         self.mock_meth.assert_called_with("/SYNC", [1, 2, 3], 4)
 
     def test_match_int9(self):
@@ -159,7 +178,7 @@ class TestTCP_1_0_Handler(unittest.TestCase):
         mock_sock = mock.Mock()
         mock_sock.recv = mock.Mock()
         mock_sock.recv.side_effect = [LEN_SIMPLE_PARAM_INT_9, _SIMPLE_PARAM_INT_9, b""]
-        osc_tcp_server._TCPHandler1_0(mock_sock, self.client_address, self.server)
+        osc_tcp_server.TCPHandler(mock_sock, self.client_address, self.server)
         self.assertTrue(self.mock_meth.called)
         self.mock_meth.assert_called_with("/debug", 9)
 
@@ -172,7 +191,7 @@ class TestTCP_1_0_Handler(unittest.TestCase):
             _SIMPLE_MSG_NO_PARAMS,
             b"",
         ]
-        osc_tcp_server._TCPHandler1_0(mock_sock, self.client_address, self.server)
+        osc_tcp_server.TCPHandler(mock_sock, self.client_address, self.server)
         self.mock_meth.assert_called_with("/SYNC")
 
     def test_match_default_handler(self):
@@ -184,7 +203,7 @@ class TestTCP_1_0_Handler(unittest.TestCase):
             _SIMPLE_MSG_NO_PARAMS,
             b"",
         ]
-        osc_tcp_server._TCPHandler1_0(mock_sock, self.client_address, self.server)
+        osc_tcp_server.TCPHandler(mock_sock, self.client_address, self.server)
         self.mock_meth.assert_called_with("/SYNC")
 
     def test_response_no_args(self):
@@ -201,7 +220,7 @@ class TestTCP_1_0_Handler(unittest.TestCase):
         ]
         mock_sock.sendall = mock.Mock()
         mock_sock.sendall.return_value = None
-        osc_tcp_server._TCPHandler1_0(mock_sock, self.client_address, self.server)
+        osc_tcp_server.TCPHandler(mock_sock, self.client_address, self.server)
         mock_sock.sendall.assert_called_with(
             b"\x00\x00\x00\x0c/SYNC\00\00\00,\00\00\00"
         )
@@ -225,7 +244,7 @@ class TestTCP_1_0_Handler(unittest.TestCase):
         ]
         mock_sock.sendall = mock.Mock()
         mock_sock.sendall.return_value = None
-        osc_tcp_server._TCPHandler1_0(mock_sock, self.client_address, self.server)
+        osc_tcp_server.TCPHandler(mock_sock, self.client_address, self.server)
         mock_sock.sendall.assert_called_with(
             b"\x00\x00\x00\x1c/SYNC\00\00\00,isf\x00\x00\x00\x00\x00\x00\x00\x012\x00\x00\x00@@\x00\x00"
         )
@@ -236,10 +255,9 @@ class TestAsync1_1Handler(unittest.IsolatedAsyncioTestCase):
         super().setUp()
         self.dispatcher = dispatcher.Dispatcher()
         # We do not want to create real UDP connections during unit tests.
-        self.server = unittest.mock.Mock(spec=osc_tcp_server.BlockingOSCTCPServer)
-        # Need to attach property mocks to types, not objects... weird.
-        type(self.server).dispatcher = unittest.mock.PropertyMock(
-            return_value=self.dispatcher
+        self.server = unittest.mock.Mock(
+            spec=osc_tcp_server.BlockingOSCTCPServer,
+            dispatcher=self.dispatcher,
         )
         self.client_address = ("127.0.0.1", 8080)
         self.mock_writer = mock.Mock()

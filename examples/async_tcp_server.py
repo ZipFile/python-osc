@@ -1,6 +1,6 @@
 import argparse
 import asyncio
-import sys
+import logging
 
 from pythonosc.dispatcher import Dispatcher
 from pythonosc.osc_tcp_server import AsyncOSCTCPServer
@@ -42,10 +42,6 @@ async def init_main():
             tg.create_task(loop())
 
 
-if sys.version_info >= (3, 7):
-    asyncio.run(init_main())
-else:
-    # TODO(python-upgrade): drop this once 3.6 is no longer supported
-    event_loop = asyncio.get_event_loop()
-    event_loop.run_until_complete(init_main())
-    event_loop.close()
+if __name__ == "__main__":
+    logging.basicConfig(level=logging.DEBUG)
+    asyncio.run(init_main(), debug=True)

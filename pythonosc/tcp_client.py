@@ -2,19 +2,19 @@
 
 import asyncio
 import socket
-import struct
-from typing import AsyncGenerator, Generator, Iterable, List, Union
+from contextlib import suppress
+from typing import Any, AsyncGenerator, Awaitable, Generator, Iterable, List, Union
 
-from pythonosc import slip
 from pythonosc.dispatcher import Dispatcher
 from pythonosc.osc_bundle import OscBundle
 from pythonosc.osc_message import OscMessage
 from pythonosc.osc_message_builder import ArgValue, build_msg
-from pythonosc.osc_tcp_server import MODE_1_1
+from pythonosc.osc_tcp_server import MODE_1_1, get_framing
+from pythonosc.parsing.framing import FramingParser
 
 
-class TCPClient(object):
-    """Async OSC client to send :class:`OscMessage` or :class:`OscBundle` via TCP"""
+class TCPClient:
+    """OSC client to send :class:`OscMessage` or :class:`OscBundle` via TCP"""
 
     def __init__(
         self,
@@ -32,11 +32,13 @@ class TCPClient(object):
             family: address family parameter (passed to socket.getaddrinfo)
             timeout: Default timeout in seconds for socket operations
         """
+
         self.address = address
         self.port = port
         self.family = family
-        self.mode = mode
         self._timeout = timeout
+        self._framing = get_framing(mode)
+        self._parser = FramingParser(self._framing)
         self.socket = socket.socket(self.family, socket.SOCK_STREAM)
         self.socket.settimeout(timeout)
         self.socket.connect((address, port))
@@ -53,60 +55,26 @@ class TCPClient(object):
         Args:
             content: Message or bundle to be sent
         """
-        if self.mode == MODE_1_1:
-            self.socket.sendall(slip.encode(content.dgram))
-        else:
-            b = struct.pack("!I", len(content.dgram))
-            self.socket.sendall(b + content.dgram)
+        self.socket.sendall(self._framing.encode(content.dgram))
 
     def receive(self, timeout: float | None = None) -> List[bytes]:
+        messages = []
         effective_timeout = timeout if timeout is not None else self._timeout
         self.socket.settimeout(effective_timeout)
-        if self.mode == MODE_1_1:
-            try:
-                buf = self.socket.recv(4096)
-            except (TimeoutError, socket.timeout):
-                return []
-            if not buf:
-                return []
-            # If the last byte is not an END marker there could be more data coming
-            while buf[-1] != 192:
-                try:
-                    newbuf = self.socket.recv(4096)
-                except (TimeoutError, socket.timeout):
-                    break
-                if not newbuf:
-                    # Maybe should raise an exception here?
-                    break
-                buf += newbuf
-            return [slip.decode(p) for p in buf.split(slip.END_END)]
-        else:
-            buf = b""
-            try:
-                lengthbuf = self.socket.recv(4)
-            except (TimeoutError, socket.timeout):
-                return []
-            (length,) = struct.unpack("!I", lengthbuf)
-            while length > 0:
-                try:
-                    newbuf = self.socket.recv(length)
-                except (TimeoutError, socket.timeout):
-                    return []
-                if not newbuf:
-                    return []
-                buf += newbuf
-                length -= len(newbuf)
-            return [buf]
+
+        with suppress(TimeoutError):
+            while chunk := self.socket.recv(16384):
+                messages.extend(self._parser.feed(chunk))
+
+        return messages
 
     def close(self):
+        self._parser.reset()
         self.socket.close()
 
 
 class SimpleTCPClient(TCPClient):
     """Simple OSC client that automatically builds :class:`OscMessage` from arguments"""
-
-    def __init__(self, *args, **kwargs):
-        super().__init__(*args, **kwargs)
 
     def send_message(
         self, address: str, value: Union[ArgValue, Iterable[ArgValue]] = ""
@@ -131,7 +99,9 @@ class SimpleTCPClient(TCPClient):
 class TCPDispatchClient(SimpleTCPClient):
     """OSC TCP Client that includes a :class:`Dispatcher` for handling responses and other messages from the server"""
 
-    dispatcher = Dispatcher()
+    def __init__(self, *args: Any, dispatcher: Dispatcher | None = None, **kwargs: Any):
+        self.dispatcher = dispatcher or Dispatcher()
+        super().__init__(*args, **kwargs)
 
     def handle_messages(self, timeout_sec: float | None = None) -> None:
         """Wait :int:`timeout` seconds for a message from the server and process each message with the registered
@@ -168,16 +138,10 @@ class AsyncTCPClient:
         """
         self.address: str = address
         self.port: int = port
-        self.mode: str = mode
         self.family: socket.AddressFamily = family
         self._timeout = timeout
-
-    def __await__(self):
-        async def closure():
-            await self.__open__()
-            return self
-
-        return closure().__await__()
+        self._framing = get_framing(mode)
+        self._parser = FramingParser(self._framing)
 
     async def __aenter__(self):
         await self.__open__()
@@ -191,82 +155,37 @@ class AsyncTCPClient:
     async def __aexit__(self, exc_type, exc_val, exc_tb):
         await self.close()
 
-    async def send(self, content: Union[OscMessage, OscBundle]) -> None:
+    def send(self, content: Union[OscMessage, OscBundle]) -> Awaitable[None]:
         """Sends an :class:`OscMessage` or :class:`OscBundle` via TCP
 
         Args:
             content: Message or bundle to be sent
         """
-        if self.mode == MODE_1_1:
-            self.writer.write(slip.encode(content.dgram))
-        else:
-            b = struct.pack("!I", len(content.dgram))
-            self.writer.write(b + content.dgram)
-        await self.writer.drain()
+        self.writer.write(self._framing.encode(content.dgram))
+        return self.writer.drain()
+
+    def _read_with_timeout(self, timeout: float | None) -> Awaitable[bytes]:
+        return asyncio.wait_for(self.reader.read(16384), timeout)
 
     async def receive(self, timeout: float | None = None) -> List[bytes]:
+        messages = []
         effective_timeout = timeout if timeout is not None else self._timeout
-        if self.mode == MODE_1_1:
-            try:
-                buf = await asyncio.wait_for(self.reader.read(4096), effective_timeout)
-            except (TimeoutError, asyncio.TimeoutError):
-                return []
-            if not buf:
-                return []
-            # If the last byte is not an END marker there could be more data coming
-            while buf[-1] != 192:
-                try:
-                    newbuf = await asyncio.wait_for(
-                        self.reader.read(4096), effective_timeout
-                    )
-                except (TimeoutError, asyncio.TimeoutError):
-                    break
-                if not newbuf:
-                    # Maybe should raise an exception here?
-                    break
-                buf += newbuf
-            return [slip.decode(p) for p in buf.split(slip.END_END)]
-        else:
-            buf = b""
-            try:
-                lengthbuf = await asyncio.wait_for(
-                    self.reader.read(4), effective_timeout
-                )
-            except (TimeoutError, asyncio.TimeoutError):
-                return []
 
-            (length,) = struct.unpack("!I", lengthbuf)
-            while length > 0:
-                try:
-                    newbuf = await asyncio.wait_for(
-                        self.reader.read(length), effective_timeout
-                    )
-                except (TimeoutError, asyncio.TimeoutError):
-                    return []
-                if not newbuf:
-                    return []
-                buf += newbuf
-                length -= len(newbuf)
-            return [buf]
+        with suppress(TimeoutError):
+            while chunk := await self._read_with_timeout(effective_timeout):
+                messages.extend(self._parser.feed(chunk))
 
-    async def close(self):
+        return messages
+
+    def close(self) -> Awaitable[None]:
+        self._parser.reset()
         self.writer.write_eof()
         self.writer.close()
-        await self.writer.wait_closed()
+        return self.writer.wait_closed()
 
 
 class AsyncSimpleTCPClient(AsyncTCPClient):
     """Simple OSC client that automatically builds :class:`OscMessage` from arguments"""
-
-    def __init__(
-        self,
-        address: str,
-        port: int,
-        family: socket.AddressFamily = socket.AF_INET,
-        mode: str = MODE_1_1,
-        timeout: float | None = 30.0,
-    ):
-        super().__init__(address, port, family, mode, timeout)
 
     async def send_message(
         self, address: str, value: Union[ArgValue, Iterable[ArgValue]] = ""
@@ -291,7 +210,9 @@ class AsyncSimpleTCPClient(AsyncTCPClient):
 class AsyncDispatchTCPClient(AsyncTCPClient):
     """OSC Client that includes a :class:`Dispatcher` for handling responses and other messages from the server"""
 
-    dispatcher = Dispatcher()
+    def __init__(self, *args: Any, dispatcher: Dispatcher | None = None, **kwargs: Any):
+        self.dispatcher = dispatcher or Dispatcher()
+        super().__init__(*args, **kwargs)
 
     async def handle_messages(self, timeout: float | None = None) -> None:
         """Wait :int:`timeout` seconds for a message from the server and process each message with the registered

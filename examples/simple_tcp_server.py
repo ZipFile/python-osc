@@ -5,7 +5,9 @@ received packets.
 """
 
 import argparse
+import logging
 import math
+from zlib import crc32
 
 from pythonosc import osc_tcp_server
 from pythonosc.dispatcher import Dispatcher
@@ -23,6 +25,7 @@ def print_compute_handler(unused_addr, args, volume):
 
 
 if __name__ == "__main__":
+    logging.basicConfig(level=logging.DEBUG)
     parser = argparse.ArgumentParser()
     parser.add_argument("--ip", default="127.0.0.1", help="The ip to listen on")
     parser.add_argument("--port", type=int, default=5005, help="The port to listen on")
@@ -36,6 +39,7 @@ if __name__ == "__main__":
 
     dispatcher = Dispatcher()
     dispatcher.map("/filter", print)
+    dispatcher.map("/crc", lambda _, v: f"{crc32(v):08X}")
     dispatcher.map("/volume", print_volume_handler, "Volume")
     dispatcher.map("/logvolume", print_compute_handler, "Log volume", math.log)
 

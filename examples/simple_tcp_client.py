@@ -5,11 +5,15 @@ and listens for incoming messages for 1 second between each value.
 """
 
 import argparse
+import logging
 import random
+from random import randint
+from zlib import crc32
 
 from pythonosc import tcp_client
 
 if __name__ == "__main__":
+    logging.basicConfig(level=logging.DEBUG)
     parser = argparse.ArgumentParser()
     parser.add_argument("--ip", default="127.0.0.1", help="The ip of the OSC server")
     parser.add_argument(
@@ -27,6 +31,9 @@ if __name__ == "__main__":
             n = random.random()
             print(f"Sending /filter {n}")
             client.send_message("/filter", n)
+            data = bytes(random.randint(0, 255) for i in range(randint(1, 10000)))
+            print(f"Sending /crc {len(data)} bytes (should be {crc32(data):08X})")
+            client.send_message("/crc", data)
             resp = client.get_messages(1)
             for r in resp:
                 try:

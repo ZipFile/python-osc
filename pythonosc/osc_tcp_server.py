@@ -33,68 +33,37 @@ loop.run_forever()
 # mypy: disable-error-code="attr-defined"
 
 import asyncio
-import logging
 import os
 import socket
 import socketserver
-import struct
-from typing import List, Tuple
+from typing import Tuple
 
-from pythonosc import osc_message_builder, slip
+from pythonosc import osc_message_builder
 from pythonosc.dispatcher import Dispatcher
+from pythonosc.parsing.framing import (
+    BINARY_LENGTH_FRAMING,
+    SLIP_FRAMING,
+    Framing,
+    FramingParser,
+)
 
-LOG = logging.getLogger()
 MODE_1_0 = "1.0"
 MODE_1_1 = "1.1"
+FRAMING_BY_MODE: dict[str, Framing] = {
+    MODE_1_0: BINARY_LENGTH_FRAMING,
+    MODE_1_1: SLIP_FRAMING,
+}
 
 
-class _TCPHandler1_0(socketserver.BaseRequestHandler):
-    """Handles correct OSC1.0 messages.
-
-    Whether this will be run on its own thread, the server's or a whole new
-    process depends on the server you instantiated, look at their documentation.
-
-    This method is called after a basic sanity check was done on the datagram,
-    basically whether this datagram looks like an osc message or bundle,
-    if not the server won't even bother to call it and so no new
-    threads/processes will be spawned.
-    """
-
-    def handle(self) -> None:
-        LOG.debug("handle OSC 1.0 protocol")
-        while True:
-            lengthbuf = self.recvall(4)
-            if lengthbuf == b"":
-                break
-            (length,) = struct.unpack("!I", lengthbuf)
-            data = self.recvall(length)
-            if data == b"":
-                break
-
-            resp = self.server.dispatcher.call_handlers_for_packet(
-                data, self.client_address
-            )
-            # resp = _call_handlers_for_packet(data, self.server.dispatcher)
-            for r in resp:
-                if not isinstance(r, tuple):
-                    r = [r]
-                msg = osc_message_builder.build_msg(r[0], r[1:])
-                b = struct.pack("!I", len(msg.dgram))
-                self.request.sendall(b + msg.dgram)
-
-    def recvall(self, count: int) -> bytes:
-        buf = b""
-        while count > 0:
-            newbuf = self.request.recv(count)
-            if not newbuf:
-                return b""
-            buf += newbuf
-            count -= len(newbuf)
-        return buf
+def get_framing(mode: str) -> Framing:
+    try:
+        return FRAMING_BY_MODE[mode]
+    except KeyError:
+        raise ValueError(f"Unsupported OSC mode: {mode}") from None
 
 
-class _TCPHandler1_1(socketserver.BaseRequestHandler):
-    """Handles correct OSC1.1 messages.
+class TCPHandler(socketserver.BaseRequestHandler):
+    """Handles correct OSC messages.
 
     Whether this will be run on its own thread, the server's or a whole new
     process depends on the server you instantiated, look at their documentation.
@@ -106,14 +75,12 @@ class _TCPHandler1_1(socketserver.BaseRequestHandler):
     """
 
     def handle(self) -> None:
-        LOG.debug("handle OSC 1.1 protocol")
-        while True:
-            packets = self.recvall()
-            if not packets:
-                break
+        assert isinstance(self.server, OSCTCPServer)
 
-            for p in packets:
-                # resp = _call_handlers_for_packet(p, self.server.dispatcher)
+        parser = FramingParser(self.server.framing)
+
+        while chunk := self.request.recv(16384):
+            for p in parser.feed(chunk):
                 resp = self.server.dispatcher.call_handlers_for_packet(
                     p, self.client_address
                 )
@@ -121,26 +88,14 @@ class _TCPHandler1_1(socketserver.BaseRequestHandler):
                     if not isinstance(r, tuple):
                         r = [r]
                     msg = osc_message_builder.build_msg(r[0], r[1:])
-                    self.request.sendall(slip.encode(msg.dgram))
-
-    def recvall(self) -> List[bytes]:
-        buf = self.request.recv(4096)
-        if not buf:
-            return []
-        # If the last byte is not an END marker there could be more data coming
-        while buf[-1] != 192:
-            newbuf = self.request.recv(4096)
-            if not newbuf:
-                # Maybe should raise an exception here?
-                break
-            buf += newbuf
-
-        packets = [slip.decode(p) for p in buf.split(slip.END_END)]
-        return packets
+                    self.request.sendall(self.server.framing.encode(msg.dgram))
 
 
 class OSCTCPServer(socketserver.TCPServer):
     """Superclass for different flavors of OSCTCPServer"""
+
+    dispatcher: Dispatcher
+    framing: Framing
 
     def __init__(
         self,
@@ -150,9 +105,8 @@ class OSCTCPServer(socketserver.TCPServer):
         family: socket.AddressFamily | None = None,
     ):
         self.request_queue_size = 300
-        self.mode = mode
-        if mode not in [MODE_1_0, MODE_1_1]:
-            raise ValueError("OSC Mode must be '1.0' or '1.1'")
+        self.dispatcher = dispatcher
+        self.framing = get_framing(mode)
 
         if family is not None:
             self.address_family = family
@@ -171,16 +125,7 @@ class OSCTCPServer(socketserver.TCPServer):
                 # Fallback to default if resolution fails
                 pass
 
-        if self.mode == MODE_1_0:
-            super().__init__(server_address, _TCPHandler1_0)
-        else:
-            super().__init__(server_address, _TCPHandler1_1)
-        self._dispatcher = dispatcher
-
-    @property
-    def dispatcher(self):
-        """Dispatcher accessor for handlers to dispatch osc messages."""
-        return self._dispatcher
+        super().__init__(server_address, TCPHandler)
 
 
 class BlockingOSCTCPServer(OSCTCPServer):
@@ -230,8 +175,8 @@ class AsyncOSCTCPServer:
         """
         self._port = port
         self._server_address = server_address
-        self._dispatcher = dispatcher
-        self._mode = mode
+        self.dispatcher = dispatcher
+        self.framing = get_framing(mode)
 
     async def __aenter__(self):
         return self
@@ -245,9 +190,6 @@ class AsyncOSCTCPServer:
             self.handle, self._server_address, self._port
         )
 
-        addrs = ", ".join(str(sock.getsockname()) for sock in self._server.sockets)
-        LOG.debug(f"Serving on {addrs}")
-
         async with self._server:
             await self._server.serve_forever()
 
@@ -255,86 +197,28 @@ class AsyncOSCTCPServer:
         self._server.close()
         await self._server.wait_closed()
 
-    @property
-    def dispatcher(self):
-        return self._dispatcher
-
     async def handle(
         self, reader: asyncio.StreamReader, writer: asyncio.StreamWriter
     ) -> None:
+        try:
+            await self._handle(reader, writer)
+        finally:
+            if writer.can_write_eof():
+                writer.write_eof()
+            writer.close()
+            await writer.wait_closed()
+
+    async def _handle(
+        self, reader: asyncio.StreamReader, writer: asyncio.StreamWriter
+    ) -> None:
+        parser = FramingParser(self.framing)
         client_address = ("", 0)
         sock = writer.transport.get_extra_info("socket")
         if sock is not None:
             client_address = sock.getpeername()
 
-        if self._mode == MODE_1_1:
-            await self.handle_1_1(reader, writer, client_address)
-        else:
-            await self.handle1_0(reader, writer, client_address)
-        writer.write_eof()
-        LOG.debug("Close the connection")
-        writer.close()
-        await writer.wait_closed()
-
-    async def handle1_0(
-        self,
-        reader: asyncio.StreamReader,
-        writer: asyncio.StreamWriter,
-        client_address: Tuple[str, int],
-    ) -> None:
-        LOG.debug("Incoming socket open 1.0")
-        while True:
-            try:
-                buf = await reader.read(4)
-            except Exception as e:
-                LOG.exception("Read error", e)
-                return
-            if buf == b"":
-                break
-            (length,) = struct.unpack("!I", buf)
-            buf = b""
-            while length > 0:
-                newbuf = await reader.read(length)
-                if not newbuf:
-                    break
-                buf += newbuf
-                length -= len(newbuf)
-
-            result = await self.dispatcher.async_call_handlers_for_packet(
-                buf, client_address
-            )
-            for r in result:
-                if not isinstance(r, tuple):
-                    r = [r]
-                msg = osc_message_builder.build_msg(r[0], r[1:])
-                b = struct.pack("!I", len(msg.dgram))
-                writer.write(b + msg.dgram)
-                await writer.drain()
-
-    async def handle_1_1(
-        self,
-        reader: asyncio.StreamReader,
-        writer: asyncio.StreamWriter,
-        client_address: Tuple[str, int],
-    ) -> None:
-        LOG.debug("Incoming socket open 1.1")
-        while True:
-            try:
-                buf = await reader.read(4096)
-            except Exception as e:
-                LOG.exception("Read error", e)
-                return
-            if buf == b"":
-                break
-            while len(buf) > 0 and buf[-1] != 192:
-                newbuf = await reader.read(4096)
-                if not newbuf:
-                    # Maybe should raise an exception here?
-                    break
-                buf += newbuf
-
-            packets = [slip.decode(p) for p in buf.split(slip.END_END)]
-            for p in packets:
+        while chunk := await reader.read(16384):
+            for p in parser.feed(chunk):
                 result = await self.dispatcher.async_call_handlers_for_packet(
                     p, client_address
                 )
@@ -342,5 +226,5 @@ class AsyncOSCTCPServer:
                     if not isinstance(r, tuple):
                         r = [r]
                     msg = osc_message_builder.build_msg(r[0], r[1:])
-                    writer.write(slip.encode(msg.dgram))
+                    writer.write(self.framing.encode(msg.dgram))
                     await writer.drain()
